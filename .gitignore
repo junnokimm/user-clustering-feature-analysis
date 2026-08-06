@@ -26,3 +26,5 @@ dashboard-be/data/user_site_access.json
 # load test artifacts
 dashboard-be/load/k6-summary.json
 dashboard-be/benchmark/output/
+.venv/
+.omo/run-continuation/
