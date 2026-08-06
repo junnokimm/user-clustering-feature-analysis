@@ -1,838 +1,692 @@
-# UX-Stream Dashboard
+# Feature-Pipeline 본실험 실행 및 분석 가이드
 
-UX-Stream Dashboard는 웹사이트에 설치된 UX SDK로부터 사용자 행동 이벤트를 수집하고, 이를 Kafka와 Redis 기반의 실시간 파이프라인으로 처리하여 운영자에게 UX 분석 결과를 제공하는 대시보드입니다.
+## 1. 실험 목적
 
-이 대시보드는 단순히 클릭 수나 페이지뷰를 보여주는 것이 아니라, 사용자의 세션 흐름, 이탈 유형, A/B 테스트 결과, AI 기반 UX 인사이트를 함께 제공하는 것을 목표로 합니다.
+본 실험의 목적은 **이커머스 사용자 유형(persona)을 가장 잘 복원하는 feature 조합과 분석 파이프라인을 찾는 것**이다.
 
----
+LLM 기반 합성 행동 세션에는 각 세션의 정답 persona가 존재한다. 다만 이 정답 라벨은 군집화 모델의 입력으로 사용하지 않고, 군집화가 끝난 뒤 결과를 평가할 때만 사용한다.
 
-## 1. 프로젝트 개요
+즉, 다음 질문에 답하기 위한 실험이다.
 
-UX-Stream은 웹사이트 운영자와 기획자가 사용자 행동 데이터를 더 쉽게 이해하고, 실제 UI 개선과 A/B 테스트로 연결할 수 있도록 설계된 UX Observability 시스템입니다.
+1. 어떤 사용자 행동 feature 조합이 persona 구분에 가장 유효한가?
+2. 같은 feature를 사용하더라도 어떤 분석 파이프라인이 더 좋은가?
+3. 특정 feature 그룹을 제거하면 성능이 얼마나 감소하는가?
+4. 어떤 조합이 seed가 달라져도 안정적인가?
 
-전체 흐름은 다음과 같습니다.
+실제 비교 단위는 다음과 같다.
 
-```txt
-Browser SDK
-  ↓
-POST /collect
-  ↓
-Kafka topic
-  ↓
-Event Consumer
-  ↓
-Redis Read Model
-  ↓
-Dashboard API
-  ↓
-Dashboard UI
-```
-
-즉, 웹사이트에 설치된 SDK가 사용자 행동 이벤트를 수집하고, Dashboard 서버의 `/collect` endpoint로 전송합니다.
-Collector는 이벤트를 Kafka에 publish하고, Kafka consumer는 이벤트를 consume하여 Redis read model을 갱신합니다.
-Dashboard는 Redis에 정리된 데이터를 조회하여 실시간 세션, UX 이탈 유형, A/B 테스트 지표, AI 인사이트를 화면에 표시합니다.
-
----
-
-## 2. 주요 기능
-
-### 2.1 SDK 이벤트 수집
-
-Dashboard 서버는 SDK가 전송하는 사용자 행동 이벤트를 수집합니다.
-
-수집되는 주요 이벤트 예시는 다음과 같습니다.
-
-```txt
-page_view
-click
-dwell_time
-add_to_cart
-remove_from_cart
-checkout_start
-payment_attempt
-checkout_complete
-ab_config_applied
-search
-filter_change
-```
-
-현재 `/collect`는 Kafka primary publish 구조로 동작합니다.
-
-```txt
-SDK → /collect → Kafka → Consumer → Redis → Dashboard
+```text
+feature subset × analysis pipeline × seed
 ```
 
 ---
 
-### 2.2 실시간 UX 대시보드
+## 2. 담당 실험 범위
 
-Dashboard는 Redis read model을 기반으로 다음 데이터를 표시합니다.
+Computer 3 담당 범위는 다음 3개 feature subset이다.
 
-* 전체 이벤트 수
-* 최근 SDK 수집 상태
-* 시간대별 이벤트 트렌드
-* 상위 페이지
-* 상위 클릭 요소
-* 사용자 이동 흐름
-* 퍼널 요약
-* 세션 테이블
-* UX 이탈 유형 요약
-* AI UX 인사이트
+### F11: 탐색 경로 + 탐색·비교 + 퍼널
+
+사용 feature:
+
+- `depth`
+- `unique_page_ratio`
+- `revisit_rate`
+- `backtrack_count`
+- `loop_rate`
+- `search_count`
+- `filter_count`
+- `product_detail_count`
+- `review_view_count`
+- `cart_add_count`
+- `cart_remove_count`
+- `checkout_entered`
+- `payment_attempt_count`
+- `purchase_completed`
+
+확인하려는 내용:
+
+> 행동 강도와 오류 정보 없이도 사용자의 탐색, 비교, 구매 흐름만으로 persona를 복원할 수 있는가?
+
+### F13: 전체 feature - 퍼널
+
+제외 feature:
+
+- `cart_add_count`
+- `cart_remove_count`
+- `checkout_entered`
+- `payment_attempt_count`
+- `purchase_completed`
+
+확인하려는 내용:
+
+> 장바구니와 결제 같은 퍼널 정보를 제거했을 때 persona 복원 성능이 얼마나 감소하는가?
+
+### F15: 전체 feature - 탐색 경로
+
+제외 feature:
+
+- `depth`
+- `unique_page_ratio`
+- `revisit_rate`
+- `backtrack_count`
+- `loop_rate`
+
+확인하려는 내용:
+
+> 페이지 이동 경로와 반복 탐색 정보가 persona 구분에 얼마나 기여하는가?
 
 ---
 
-### 2.3 Redis 기반 세션 분석
+## 3. 분석 파이프라인
 
-Kafka consumer는 이벤트를 consume하면서 Redis에 세션 상태를 갱신합니다.
+각 feature subset에는 동일하게 3개 파이프라인을 적용한다.
 
-Redis session state에는 다음과 같은 정보가 포함됩니다.
+### A1: 전처리 feature + K-Means
 
-```txt
-session_id
-anon_user_id
-site_id
-started_at
-last_ts
-event_count
-page_view_count
-click_count
-paths
-last_path
-checkout_started
-checkout_completed
-error_count
-price_interaction_count
-filter_count
-search_count
-cart_add_count
-cart_remove_count
-payment_attempt_count
-max_step
-experiments
+```text
+원본 feature
+→ 공통 전처리
+→ K-Means
 ```
 
-Dashboard API는 이 Redis session state를 기반으로 세션 테이블과 UX 라벨 요약을 생성합니다.
+가장 기본적인 baseline이다. 직접 계산한 행동 feature만으로 persona 구조가 형성되는지 확인한다.
 
----
+### A2: UMAP + HDBSCAN
 
-### 2.4 UX 이탈 유형 분류
-
-사용자 세션은 행동 패턴에 따라 다음과 같은 UX 이탈 유형으로 분류됩니다.
-
-| Label                     | 설명                                      |
-| ------------------------- | --------------------------------------- |
-| `over_explorer`           | 여러 페이지를 오래 탐색하지만 명확한 전환으로 이어지지 않는 유형    |
-| `price_sensitive_dropper` | 가격, 쿠폰, 배송비, 할인 정보 등에 민감하게 반응하다 이탈하는 유형 |
-| `window_shopper`          | 가볍게 둘러보는 탐색 중심 유형                       |
-| `ux_friction_dropper`     | 오류, 반복 클릭, 불편한 흐름 등 UX 마찰을 겪고 이탈하는 유형   |
-| `checkout_abandoner`      | 결제 단계에 진입했지만 최종 구매까지 이어지지 않은 유형         |
-
----
-
-### 2.5 A/B 테스트
-
-Dashboard는 사이트별 A/B 테스트 생성, 배포, 일시 중지, 결과 확인 기능을 제공합니다.
-
-현재 정책은 다음과 같습니다.
-
-```txt
-Draft 실험은 여러 개 생성 가능
-Running 실험은 site_id당 최대 1개만 허용
-새 실험을 배포하려면 기존 Running 실험을 paused 처리해야 함
+```text
+원본 feature
+→ 공통 전처리
+→ UMAP embedding
+→ HDBSCAN
 ```
 
-즉 하나의 사이트에서는 동시에 하나의 실험만 실행됩니다.
-이는 A/B 테스트 결과 해석이 여러 실험의 영향으로 섞이는 것을 방지하기 위한 정책입니다.
+비선형 저차원 표현과 밀도 기반 군집화가 persona 구조를 더 잘 포착하는지 확인한다.
 
-실험 구조는 다음과 같습니다.
+HDBSCAN은 어느 군집에도 속하지 않는 데이터를 `-1` noise로 분류할 수 있다. 따라서 cluster 수와 noise ratio를 함께 확인해야 한다.
 
-```txt
-Variant A: 기존 UI
-Variant B: 관리자가 Visual Editor 또는 Agent Mode로 수정한 UI
+### A3: VAE latent + K-Means
+
+```text
+원본 feature
+→ 공통 전처리
+→ VAE latent representation
+→ K-Means
 ```
 
-기존 running 실험이 있는 상태에서 새 실험을 배포하려 하면 Dashboard는 확인 메시지를 표시합니다.
+직접 계산한 feature 공간보다 VAE가 학습한 잠재표현이 persona 복원에 유리한지 확인한다.
 
-```txt
-현재 기존 실험이 진행 중입니다.
-새 실험을 배포하려면 기존 실험을 일시 중지해야 합니다.
+---
 
-기존 실험을 일시 중지하고 새 실험을 배포하시겠습니까?
+## 4. 전체 실행 수
+
+담당 feature subset 3개, pipeline 3개, seed 3개를 조합한다.
+
+```text
+3 feature subsets
+× 3 pipelines
+× 3 seeds
+= 총 27 runs
 ```
 
-확인하면 기존 실험은 `paused`, 새 실험은 `running` 상태가 됩니다.
+사용 seed:
 
----
+- `7`
+- `42`
+- `2026`
 
-### 2.6 Visual Editor
+실행 예:
 
-Visual Editor는 관리자가 실제 웹페이지를 보면서 UI 변경안을 만들 수 있도록 돕는 기능입니다.
-
-주요 기능은 다음과 같습니다.
-
-* 특정 사이트/경로 미리보기
-* 텍스트 변경
-* 스타일 변경
-* CTA 버튼 수정
-* 변경안 저장
-* A/B 테스트 draft 생성
-* 실험 배포
-
-Visual Editor에서 만든 변경안은 Variant B에 저장됩니다.
-
----
-
-### 2.7 AI Insight
-
-Dashboard는 Redis 기반 세션 데이터와 이벤트 요약 데이터를 바탕으로 AI UX 인사이트를 생성합니다.
-
-AI 인사이트는 다음 내용을 포함할 수 있습니다.
-
-* 현재 가장 두드러진 UX 문제
-* 주요 이탈 유형
-* 이탈이 발생하는 위치
-* 근거가 되는 세션/행동 패턴
-* 개선 제안
-* A/B 테스트 아이디어
-
-현재 `/api/insights`는 `events.jsonl`이 아니라 Redis session state와 Redis event summary를 기반으로 동작합니다.
-
----
-
-### 2.8 Agent Mode
-
-Agent Mode는 대시보드 내에서 AI가 실험 생성, 인사이트 요약, 배포 제안 등을 도와주는 기능입니다.
-
-Agent는 위험한 작업을 바로 실행하지 않고 approval 흐름을 거칩니다.
-
-예를 들어 기존 running 실험이 있는 상태에서 새 실험 배포가 필요한 경우, Agent는 다음 내용을 안내하고 승인을 요청합니다.
-
-```txt
-현재 기존 실험이 진행 중입니다.
-새 실험을 배포하려면 기존 실험을 일시 중지해야 합니다.
-승인하면 기존 실험은 paused 상태가 되고 새 실험이 running 상태로 배포됩니다.
+```text
+F11 × A1 × seed 7
+F11 × A1 × seed 42
+F11 × A1 × seed 2026
+F11 × A2 × seed 7
+...
+F15 × A3 × seed 2026
 ```
 
 ---
 
-## 3. 현재 데이터 파이프라인
+## 5. 실행 전 준비
 
-### 3.1 수집 파이프라인
+### 5.1 브랜치 확인
 
-현재 `/collect`는 Kafka primary publish 구조로 동작합니다.
-
-```txt
-Browser SDK
-  ↓
-POST /collect
-  ↓
-Kafka topic: ux.events.raw
-```
-
-`/collect`는 더 이상 `events.jsonl`에 이벤트를 primary로 저장하지 않습니다.
-
-Kafka가 비활성화되어 있거나 publish에 실패하면 기본적으로 file fallback을 사용하지 않고 `503 kafka_unavailable`을 반환합니다.
-
-```json
-{
-  "ok": false,
-  "reason": "kafka_unavailable",
-  "message": "이벤트 스트림에 연결할 수 없습니다. Kafka collector 설정을 확인해 주세요.",
-  "source": "kafka",
-  "fallback_used": false
-}
-```
-
-개발용 legacy fallback이 필요한 경우에만 다음 환경변수를 사용할 수 있습니다.
-
-```env
-ENABLE_LEGACY_FILE_COLLECT_FALLBACK=true
-```
-
-단, 기본값은 `false`입니다.
-
----
-
-### 3.2 Kafka Consumer
-
-Kafka consumer는 Kafka topic의 이벤트를 consume하여 Redis read model을 갱신합니다.
-
-```txt
-Kafka topic
-  ↓
-event-consumer
-  ↓
-Redis
-```
-
-Consumer는 다음 Redis 데이터를 갱신합니다.
-
-* Redis session state
-* Redis event summary
-* Redis A/B metrics
-* Redis variant assignment
-
----
-
-### 3.3 Redis Read Model
-
-Dashboard 주요 API는 Redis read model을 조회합니다.
-
-| API                      | 데이터 소스                                    |
-| ------------------------ | ----------------------------------------- |
-| `/api/event-summary`     | Redis event summary                       |
-| `/api/sessions`          | Redis session state                       |
-| `/api/realtime/sessions` | Redis session state                       |
-| `/api/labels/summary`    | Redis session state 기반 label summary      |
-| `/api/insights`          | Redis session state + Redis event summary |
-| `/api/metrics`           | Redis experiment metrics                  |
-
-Redis가 비활성화되었거나 연결에 실패하면 file fallback을 사용하지 않고 명시적인 오류를 반환합니다.
-
-```json
-{
-  "ok": false,
-  "reason": "redis_unavailable",
-  "message": "실시간 데이터 저장소에 연결할 수 없습니다. Redis와 event consumer 상태를 확인해 주세요.",
-  "source": "redis",
-  "fallback_used": false
-}
-```
-
----
-
-## 4. 주요 디렉터리 구조
-
-```txt
-Dashboard/
-├─ dashboard-be/
-│  ├─ server.js
-│  ├─ routes/
-│  │  ├─ chat-routes.js
-│  │  └─ agent-routes.js
-│  ├─ services/
-│  │  ├─ collector/
-│  │  │  └─ collect-handler.js
-│  │  ├─ stores/
-│  │  │  ├─ event-store.js
-│  │  │  ├─ experiment-store.js
-│  │  │  ├─ redis-session-store.js
-│  │  │  ├─ redis-event-summary-store.js
-│  │  │  └─ redis-metrics-store.js
-│  │  ├─ analytics/
-│  │  │  ├─ session-state.js
-│  │  │  ├─ redis-session-analytics-service.js
-│  │  │  ├─ experiment-status.js
-│  │  │  └─ running-experiment-policy.js
-│  │  ├─ agent/
-│  │  ├─ runtime/
-│  │  │  ├─ kafka.js
-│  │  │  ├─ redis.js
-│  │  │  └─ infra-config.js
-│  │  └─ read-models/
-│  ├─ workers/
-│  │  └─ event-consumer.js
-│  ├─ analytics/
-│  │  ├─ labeler.js
-│  │  ├─ pipeline.js
-│  │  └─ funnel.js
-│  ├─ insights/
-│  ├─ personas/
-│  ├─ data/
-│  └─ test/
-│
-├─ dashboard-fe/
-│  └─ public/
-│     ├─ dashboard.html
-│     ├─ dashboard.js
-│     ├─ dashboard.css
-│     ├─ editor.html
-│     ├─ editor.js
-│     └─ analytics-chat.js
-│
-├─ vendor/
-│  └─ enejwl-ux-sdk-0.1.1.tgz
-├─ package.json
-└─ README.md
-```
-
----
-
-## 5. 주요 API
-
-### 5.1 SDK 수집
-
-```txt
-POST /collect
-```
-
-SDK가 수집한 이벤트 batch를 Kafka로 publish합니다.
-
-성공 응답:
-
-```json
-{
-  "ok": true,
-  "received": 3,
-  "source": "kafka",
-  "fallback_used": false
-}
-```
-
-Kafka 비활성화 또는 publish 실패:
-
-```json
-{
-  "ok": false,
-  "reason": "kafka_unavailable",
-  "message": "이벤트 스트림에 연결할 수 없습니다. Kafka collector 설정을 확인해 주세요.",
-  "source": "kafka",
-  "fallback_used": false
-}
-```
-
----
-
-### 5.2 SDK 스크립트
-
-```txt
-GET /sdk.js
-```
-
-Dashboard에 포함된 SDK 패키지를 브라우저에서 로드할 수 있도록 제공합니다.
-
----
-
-### 5.3 A/B 설정 조회
-
-```txt
-GET /api/config?site_id={site_id}&url={url}
-```
-
-SDK가 현재 페이지에 적용 가능한 running 실험 설정을 조회합니다.
-
-중복 running 실험이 존재할 경우 서버는 최신 `published_at` 또는 `updated_at` 기준으로 하나만 내려주는 방어 로직을 가집니다.
-
----
-
-### 5.4 이벤트 요약
-
-```txt
-GET /api/event-summary?site_id={site_id}
-```
-
-Redis event summary를 조회합니다.
-
-반환 데이터 예시:
-
-```txt
-total_events
-top_pages
-top_elements
-page_flow
-trend
-sdk_status
-funnel
-journey
-```
-
----
-
-### 5.5 세션 목록
-
-```txt
-GET /api/sessions?site_id={site_id}
-```
-
-Redis session state를 기반으로 세션 목록을 반환합니다.
-
----
-
-### 5.6 UX 라벨 요약
-
-```txt
-GET /api/labels/summary?site_id={site_id}
-```
-
-Redis session state를 기반으로 UX 이탈 유형 요약을 반환합니다.
-
----
-
-### 5.7 AI 인사이트
-
-```txt
-GET /api/insights?site_id={site_id}
-```
-
-Redis session state와 Redis event summary를 기반으로 AI UX 인사이트를 생성합니다.
-
----
-
-### 5.8 A/B 테스트 목록
-
-```txt
-GET /api/experiments?site_id={site_id}
-```
-
-사이트의 실험 목록을 반환합니다.
-
----
-
-### 5.9 A/B 테스트 상태 변경
-
-```txt
-PATCH /api/experiments/:id
-```
-
-실험 상태를 변경합니다.
-
-예시:
-
-```json
-{
-  "site_id": "legend-ecommerce",
-  "status": "running"
-}
-```
-
-기존 running 실험이 있을 경우 다음과 같은 응답을 반환합니다.
-
-```json
-{
-  "ok": false,
-  "reason": "running_experiment_exists",
-  "message": "이미 진행 중인 실험이 있습니다. 기존 실험을 일시 중지한 뒤 새 실험을 배포할 수 있습니다.",
-  "running_experiment": {
-    "id": "exp_old",
-    "key": "exp_home_cta_v1",
-    "status": "running"
-  }
-}
-```
-
-기존 running 실험을 paused 처리하고 새 실험을 배포하려면 다음 옵션을 사용합니다.
-
-```json
-{
-  "site_id": "legend-ecommerce",
-  "status": "running",
-  "replace_running": true
-}
-```
-
----
-
-## 6. 환경변수
-
-`.env` 또는 실행 환경에 다음 값을 설정할 수 있습니다.
-
-```env
-# Server
-PORT=3001
-NODE_ENV=development
-
-# Kafka collector
-ENABLE_KAFKA_DUAL_WRITE=true
-KAFKA_BROKERS=localhost:9092
-KAFKA_CLIENT_ID=ux-sdk-service
-KAFKA_TOPIC_EVENTS=ux.events.raw
-KAFKA_CONSUMER_GROUP_ID=ux-sdk-event-consumer
-KAFKA_CONSUMER_FROM_BEGINNING=false
-
-# Legacy collect fallback
-ENABLE_LEGACY_FILE_COLLECT_FALLBACK=false
-
-# Redis read model
-ENABLE_REDIS_SESSION_STORE=true
-REDIS_URL=redis://localhost:6379
-REDIS_KEY_PREFIX=uxsdk
-REDIS_SESSION_TTL_SEC=1800
-REDIS_ASSIGNMENT_TTL_SEC=2592000
-
-# LLM
-OPENAI_API_KEY=
-LLM_PROVIDER=openai
-LLM_MODEL=
-```
-
-> 현재 Kafka 활성화 환경변수 이름은 기존 호환성을 위해 `ENABLE_KAFKA_DUAL_WRITE`를 사용합니다.
-> 다만 현재 구조는 dual write가 아니라 Kafka primary collector 구조입니다.
-> 추후 `ENABLE_KAFKA_COLLECTOR`와 같은 이름으로 정리할 수 있습니다.
-
----
-
-## 7. 로컬 실행
-
-### 7.1 의존성 설치
+프로젝트 루트에서 실행한다.
 
 ```bash
-npm install
+git switch test
+git status
 ```
 
-또는 backend 디렉터리 기준으로 실행하는 구조라면:
+실험 중에는 코드가 바뀌지 않도록 한다.
+
+현재 기준 commit과 변경 상태를 기록하려면 다음을 실행한다.
+
+```bash
+git rev-parse HEAD
+git diff --stat
+```
+
+### 5.2 실행 위치
+
+실험 명령은 반드시 다음 폴더에서 실행한다.
+
+```text
+Dashboard/dashboard-be
+```
+
+프로젝트 루트 `Dashboard/`에서 실행하면 Python이 `experiment` 모듈을 찾지 못해 다음 오류가 발생할 수 있다.
+
+```text
+ModuleNotFoundError: No module named 'experiment'
+```
+
+이동:
 
 ```bash
 cd dashboard-be
-npm install
+```
+
+현재 위치 확인:
+
+```bash
+pwd
+ls
+```
+
+`experiment`, `benchmark`, `requirements-experiment.txt`가 보여야 한다.
+
+### 5.3 Python 가상환경 생성
+
+가상환경이 없다면 생성한다.
+
+프로젝트 루트에 `.venv`를 만드는 경우:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+```
+
+`dashboard-be`로 이동한 뒤 루트의 가상환경을 사용할 때:
+
+```bash
+source ../.venv/bin/activate
+```
+
+터미널 앞에 `(.venv)`가 표시되면 활성화된 상태다.
+
+확인:
+
+```bash
+which python
+python --version
+```
+
+실험 의존성 설치:
+
+```bash
+python -m pip install -r requirements-experiment.txt
+```
+
+CLI 확인:
+
+```bash
+python -m experiment.cli --help
 ```
 
 ---
 
-### 7.2 Kafka 실행
+## 6. 본실험 실행 명령
 
-로컬 Docker 예시:
+`dashboard-be` 폴더에서 다음 명령을 실행한다.
 
 ```bash
-docker run -d \
-  --name ux-sdk-kafka \
-  -p 9092:9092 \
-  apache/kafka:3.7.1
+mkdir -p experiment/output/computer-3
+
+caffeinate -dimsu python -m experiment.cli \
+  --data-dir benchmark/output/merged-7500 \
+  --feature-subsets F11 F13 F15 \
+  --pipelines A1 A2 A3 \
+  --seeds 7 42 2026 \
+  --split-seed 2026 \
+  --output-dir experiment/output/computer-3 \
+  2>&1 | tee experiment/output/computer-3/console.log
 ```
 
-Kafka topic 생성 예시:
+### 명령어 옵션 의미
 
-```bash
-docker exec -it ux-sdk-kafka /opt/kafka/bin/kafka-topics.sh \
-  --bootstrap-server localhost:9092 \
-  --create \
-  --topic ux.events.raw \
-  --partitions 1 \
-  --replication-factor 1
+| 옵션 | 의미 |
+|---|---|
+| `caffeinate -dimsu` | 실험 중 Mac이 잠자기 상태로 들어가는 것을 방지 |
+| `python -m experiment.cli` | 구현된 실험 CLI 실행 |
+| `--data-dir` | 7,500개 합성 세션 데이터 위치 |
+| `--feature-subsets` | 실행할 feature 조합 |
+| `--pipelines` | 실행할 분석 파이프라인 |
+| `--seeds` | 반복 실험에 사용할 seed |
+| `--split-seed` | train/validation/test 분할을 고정하는 seed |
+| `--output-dir` | 결과 저장 위치 |
+| `2>&1` | 표준 오류를 표준 출력에 합침 |
+| `tee` | 터미널 출력과 로그 파일 저장을 동시에 수행 |
+
+---
+
+## 7. 명령 한 번으로 실행되는 내용
+
+위 명령을 한 번 실행하면 F11, F13, F15에 대해 A1, A2, A3와 seed 3개가 모두 조합되어 총 27개 run이 실행된다.
+
+실행 과정은 다음과 같다.
+
+```text
+merged-7500 데이터 로드
+→ 원시 이벤트에서 19개 feature 추출
+→ 고정된 train/validation/test split 생성 또는 재사용
+→ feature subset 선택
+→ train-only preprocessing
+→ pipeline 학습 및 예측
+→ 정답 persona와 군집 결과 비교
+→ 평가 지표 계산
+→ run별 결과 저장
+→ seed 평균과 표준편차 집계
 ```
 
-Topic 확인:
+터미널에는 각 run의 시작, 완료, skip, 실패 상태가 출력된다.
 
-```bash
-docker exec -it ux-sdk-kafka /opt/kafka/bin/kafka-topics.sh \
-  --bootstrap-server localhost:9092 \
-  --list
+같은 내용은 다음 로그 파일에도 저장된다.
+
+```text
+experiment/output/computer-3/console.log
 ```
 
 ---
 
-### 7.3 Redis 실행
+## 8. 중단된 경우 재실행
 
-로컬 Docker 예시:
+실험이 중간에 종료되더라도 같은 명령을 다시 실행하면 된다.
 
-```bash
-docker run -d \
-  --name ux-sdk-redis \
-  -p 6379:6379 \
-  redis:7
-```
+완료된 run은 건너뛰고 미완료 또는 실패 run만 다시 실행하도록 구현되어 있다.
 
-연결 확인:
+로그를 이어서 저장하려면 `tee -a`를 사용한다.
 
 ```bash
-redis-cli ping
+caffeinate -dimsu python -m experiment.cli \
+  --data-dir benchmark/output/merged-7500 \
+  --feature-subsets F11 F13 F15 \
+  --pipelines A1 A2 A3 \
+  --seeds 7 42 2026 \
+  --split-seed 2026 \
+  --output-dir experiment/output/computer-3 \
+  2>&1 | tee -a experiment/output/computer-3/console.log
 ```
 
-정상 응답:
+기존 완료 run까지 다시 실행할 수 있는 `--force` 옵션은 사용하지 않는 것이 좋다.
 
-```txt
-PONG
+---
+
+## 9. 생성되는 결과
+
+결과 폴더는 대략 다음 구조를 가진다.
+
+```text
+experiment/output/computer-3/
+├── console.log
+├── extracted_features.csv
+├── split_manifest.csv
+├── experiment_config.json
+├── environment.json
+├── run_results.csv
+├── summary.csv
+└── runs/
+    ├── F11_A1_seed7/
+    ├── F11_A1_seed42/
+    ├── F11_A1_seed2026/
+    ├── F11_A2_seed7/
+    ├── ...
+    └── F15_A3_seed2026/
+```
+
+각 run 폴더에는 일반적으로 다음 파일이 저장된다.
+
+```text
+config.json
+metrics.json
+predictions.csv
+contingency.csv
+mapping.json
+status.json
+```
+
+### 주요 공통 파일
+
+#### `extracted_features.csv`
+
+7,500개 세션에서 추출한 행동 feature가 저장된다.
+
+정답 persona는 군집화 입력 feature에 포함되지 않아야 한다.
+
+#### `split_manifest.csv`
+
+각 세션이 train, validation, test 중 어디에 속하는지 저장한다.
+
+모든 feature subset과 pipeline은 동일한 split을 사용한다.
+
+#### `run_results.csv`
+
+27개 개별 run의 성능을 한 행씩 저장한다.
+
+#### `summary.csv`
+
+동일한 `feature subset × pipeline` 조건의 seed 3회 결과를 평균과 표준편차로 요약한다.
+
+최종 비교에서 가장 먼저 확인할 파일이다.
+
+#### `predictions.csv`
+
+각 test 세션의 정답 persona와 예측 cluster를 저장한다.
+
+컬럼 순서는 다음과 같이 고정되어 있다.
+
+```text
+session_id,true_label,cluster
+```
+
+#### `contingency.csv`
+
+정답 persona와 예측 cluster가 어떻게 대응되는지 보여주는 교차표다.
+
+#### `mapping.json`
+
+Hungarian matching을 통해 cluster ID를 어떤 persona와 대응시켰는지 저장한다.
+
+#### `status.json`
+
+각 run의 상태를 저장한다.
+
+- `pending`
+- `running`
+- `completed`
+- `failed`
+
+---
+
+## 10. 실험 완료 여부 확인
+
+생성된 run 폴더 수 확인:
+
+```bash
+find experiment/output/computer-3/runs \
+  -mindepth 1 -maxdepth 1 -type d | wc -l
+```
+
+정상 완료 시 예상 값:
+
+```text
+27
+```
+
+완료 run 수 확인:
+
+```bash
+grep -R '"completed"' \
+  experiment/output/computer-3/runs/*/status.json | wc -l
+```
+
+정상 완료 시:
+
+```text
+27
+```
+
+실패 run 확인:
+
+```bash
+grep -R '"failed"' \
+  experiment/output/computer-3/runs/*/status.json
+```
+
+출력이 없다면 실패 run이 없는 것이다.
+
+결과 파일 열기:
+
+```bash
+open experiment/output/computer-3/summary.csv
+open experiment/output/computer-3/run_results.csv
+```
+
+터미널에서 확인:
+
+```bash
+column -s, -t < experiment/output/computer-3/summary.csv | less -S
 ```
 
 ---
 
-### 7.4 Dashboard 서버 실행
+## 11. 평가 지표 해석
 
-```bash
-npm run dev
+### 외부 평가 지표
+
+정답 persona와 군집 결과의 일치도를 평가한다.
+
+#### ARI
+
+군집 결과와 정답 라벨의 일치도를 우연 일치까지 보정한 지표다.
+
+- 높을수록 persona 복원이 잘 됨
+- `1`에 가까울수록 거의 완전 일치
+- `0` 근처면 무작위 수준
+- 음수가 나오면 무작위보다 좋지 않을 수 있음
+
+#### NMI
+
+정답 persona와 cluster가 공유하는 정보량을 평가한다.
+
+- `0`에 가까우면 관계가 약함
+- `1`에 가까우면 강하게 일치
+
+#### AMI
+
+NMI에서 우연한 일치를 보정한 지표다.
+
+#### Macro-F1
+
+각 persona별 F1 점수를 동일한 비중으로 평균낸 값이다.
+
+cluster ID 자체에는 의미가 없으므로 Hungarian matching을 적용한 뒤 계산한다.
+
+### 내부 평가 지표
+
+정답 persona를 사용하지 않고 군집 자체의 기하학적 품질을 평가한다.
+
+#### Silhouette Score
+
+- 높을수록 cluster 내부는 가깝고 cluster 간은 잘 분리됨
+
+#### Davies-Bouldin Index
+
+- 낮을수록 좋음
+
+#### Calinski-Harabasz Index
+
+- 높을수록 좋음
+
+### 외부 지표를 우선해야 하는 이유
+
+이 연구의 목적은 단순히 데이터를 깔끔하게 나누는 것이 아니라, 사전에 정의된 persona를 복원하는 것이다.
+
+따라서 다음과 같은 결과가 가능하다.
+
+```text
+Silhouette는 높음
+ARI/NMI는 낮음
 ```
 
-또는 backend 기준:
+이 경우:
+
+> 군집 자체는 깔끔하지만, 우리가 의도한 persona 기준으로 나뉜 것은 아니다.
+
+라고 해석해야 한다.
+
+---
+
+## 12. 결과 분석 순서
+
+### 1단계: 실행 상태 확인
+
+- 27개 run이 모두 생성됐는지
+- completed가 27개인지
+- failed run이 없는지
+
+### 2단계: `summary.csv` 확인
+
+각 `feature subset × pipeline`의 평균 성능과 표준편차를 비교한다.
+
+우선순위:
+
+1. ARI mean
+2. NMI/AMI mean
+3. Macro-F1 mean
+4. seed별 표준편차
+5. 내부 지표
+
+### 3단계: seed 안정성 확인
+
+평균뿐 아니라 표준편차도 함께 본다.
+
+예:
+
+```text
+ARI = 0.78 ± 0.01
+```
+
+반복해도 안정적인 결과다.
+
+```text
+ARI = 0.78 ± 0.18
+```
+
+평균은 높지만 seed에 따라 결과가 크게 변하는 불안정한 조건이다.
+
+### 4단계: F11, F13, F15 비교
+
+#### F11 vs F13
+
+퍼널 정보를 포함했을 때 성능이 좋아지는지 확인한다.
+
+F13의 성능이 크게 낮다면:
+
+> 장바구니, 결제 진입, 결제 시도, 구매 완료 같은 퍼널 정보가 persona 복원에 중요하다.
+
+#### F11 vs F15
+
+탐색 경로 정보를 포함했을 때 성능이 좋아지는지 확인한다.
+
+F15의 성능이 크게 낮다면:
+
+> 재방문, 뒤로 가기, 반복 이동과 같은 탐색 경로 정보가 persona 구분에 중요하다.
+
+#### F13 vs F15
+
+퍼널 정보와 탐색 경로 중 어느 정보가 더 중요한지 비교한다.
+
+단, 엄밀한 ablation 해석은 전체 19개 feature를 사용한 F0 결과와 함께 비교해야 한다.
+
+### 5단계: A1, A2, A3 비교
+
+#### A1이 가장 좋을 때
+
+직접 설계한 hand-crafted feature가 persona 구조를 충분히 표현하고, 복잡한 representation이 필요하지 않을 가능성이 있다.
+
+#### A2가 가장 좋을 때
+
+persona 구조가 비선형적이고 밀도 기반 군집화가 유효할 가능성이 있다.
+
+#### A2 내부 지표만 높고 외부 지표가 낮을 때
+
+HDBSCAN이 persona가 아닌 더 세부적인 행동 패턴을 찾았을 가능성이 있다.
+
+#### A3가 가장 좋을 때
+
+VAE가 학습한 잠재표현이 원래 feature 공간보다 persona 복원에 더 적합할 가능성이 있다.
+
+### 6단계: run별 상세 확인
+
+특정 조건이 이상하면 다음을 확인한다.
+
+- `metrics.json`
+- `predictions.csv`
+- `contingency.csv`
+- `mapping.json`
+- `status.json`
+
+특히 contingency matrix를 보면 하나의 persona가 여러 cluster로 분할됐는지, 여러 persona가 같은 cluster에 섞였는지 확인할 수 있다.
+
+---
+
+## 13. 최종적으로 얻고 싶은 결론
+
+본 실험은 단순히 가장 높은 점수를 찾는 것이 아니라 다음을 밝히는 것이 목적이다.
+
+1. 전체 feature를 모두 사용하는 것이 항상 최선인지
+2. 탐색 경로, 탐색·비교, 퍼널 중 어떤 행동 신호가 중요한지
+3. 특정 feature 그룹을 제거하면 성능이 얼마나 감소하는지
+4. 직접 군집화, UMAP-HDBSCAN, VAE-K-Means 중 어떤 방식이 적합한지
+5. 어떤 조합이 seed가 달라져도 안정적인지
+
+가능한 결과 해석 예:
+
+> F13에서 외부 평가 지표가 크게 감소하여 퍼널 행동 정보가 구매 관련 persona 복원에 핵심적인 것으로 나타났다.
+
+> F15의 성능 감소 폭이 작다면 탐색 경로를 제외해도 검색·비교와 퍼널 feature만으로 상당 부분 persona를 구분할 수 있음을 시사한다.
+
+> A2는 높은 Silhouette를 보였지만 ARI와 NMI가 낮아, 기하학적으로 분명한 행동 군집을 만들었으나 사전 정의 persona와는 다른 구조를 포착한 것으로 해석할 수 있다.
+
+> A3가 A1보다 높은 외부 지표와 낮은 seed 표준편차를 보였다면, VAE latent representation이 persona 구조를 더 안정적으로 표현한 것으로 볼 수 있다.
+
+---
+
+## 14. 주의사항
+
+- 정답 라벨은 평가 단계에서만 사용해야 한다.
+- test 결과를 보고 하이퍼파라미터를 다시 선택하면 안 된다.
+- 최고값만 보지 말고 seed 평균과 표준편차를 함께 봐야 한다.
+- 내부 지표가 높다고 persona 복원 성능이 좋은 것은 아니다.
+- A2의 noise ratio와 실제 cluster 수를 함께 기록해야 한다.
+- F13과 F15의 정확한 ablation 효과는 팀원의 F0 baseline과 함께 해석해야 한다.
+- 실험 도중 코드를 수정하면 이전 run과 이후 run의 조건이 달라질 수 있으므로 피해야 한다.
+- 결과 폴더를 삭제하거나 `--force`로 재실행하기 전에 기존 결과를 보존해야 한다.
+
+---
+
+## 15. 실행 명령 요약
 
 ```bash
+git switch test
 cd dashboard-be
-npm run dev
+source ../.venv/bin/activate
+python -m pip install -r requirements-experiment.txt
+
+mkdir -p experiment/output/computer-3
+
+caffeinate -dimsu python -m experiment.cli \
+  --data-dir benchmark/output/merged-7500 \
+  --feature-subsets F11 F13 F15 \
+  --pipelines A1 A2 A3 \
+  --seeds 7 42 2026 \
+  --split-seed 2026 \
+  --output-dir experiment/output/computer-3 \
+  2>&1 | tee experiment/output/computer-3/console.log
 ```
 
-서버 기본 주소:
-
-```txt
-http://localhost:3001
-```
-
----
-
-### 7.5 Kafka Consumer 실행
+중단 후 재개:
 
 ```bash
-npm run worker:events
+caffeinate -dimsu python -m experiment.cli \
+  --data-dir benchmark/output/merged-7500 \
+  --feature-subsets F11 F13 F15 \
+  --pipelines A1 A2 A3 \
+  --seeds 7 42 2026 \
+  --split-seed 2026 \
+  --output-dir experiment/output/computer-3 \
+  2>&1 | tee -a experiment/output/computer-3/console.log
 ```
-
-Consumer는 Kafka topic의 이벤트를 읽어 Redis read model을 갱신합니다.
-
----
-
-## 8. 운영 실행 예시
-
-PM2를 사용하는 경우:
-
-```bash
-pm2 start "npm run dev" --name dashboard
-pm2 start "npm run worker:events" --name dashboard-worker
-pm2 save
-```
-
-환경변수 변경 후 재시작:
-
-```bash
-pm2 restart dashboard --update-env
-pm2 restart dashboard-worker --update-env
-```
-
-로그 확인:
-
-```bash
-pm2 logs dashboard
-pm2 logs dashboard-worker
-```
-
----
-
-## 9. SDK 연동 예시
-
-일반 HTML 사이트에서는 다음과 같이 사용할 수 있습니다.
-
-```html
-<script src="http://localhost:3001/sdk.js"></script>
-<script>
-  MiniSDK.create({
-    siteId: "legend-ecommerce",
-    appId: "legend-ecommerce",
-    endpoint: "http://localhost:3001/collect",
-    configEndpoint: "http://localhost:3001/api/config",
-    debug: true
-  }).install();
-</script>
-```
-
-React/Vite 프로젝트에서는 proxy를 사용할 수 있습니다.
-
-```ts
-server: {
-  proxy: {
-    "/uxsdk": {
-      target: "http://localhost:3001",
-      changeOrigin: true,
-      rewrite: (requestPath) => requestPath.replace(/^\/uxsdk/, ""),
-    },
-  },
-}
-```
-
-SDK 설정 예시:
-
-```ts
-window.MiniSDK?.create({
-  endpoint: "/uxsdk/collect",
-  configEndpoint: "/uxsdk/api/config",
-  siteId: "legend-ecommerce",
-  appId: "legend-ecommerce",
-  schemaVersion: 1,
-  debug: true
-}).install();
-```
-
-요청 매핑:
-
-| Ecommerce 요청        | Dashboard 요청  |
-| ------------------- | ------------- |
-| `/uxsdk/sdk.js`     | `/sdk.js`     |
-| `/uxsdk/collect`    | `/collect`    |
-| `/uxsdk/api/config` | `/api/config` |
-
----
-
-## 10. 테스트
-
-정적 문법 확인:
-
-```bash
-node --check dashboard-be/server.js
-node --check dashboard-be/services/collector/collect-handler.js
-node --check dashboard-be/services/stores/event-store.js
-node --check dashboard-be/workers/event-consumer.js
-node --check dashboard-be/routes/chat-routes.js
-node --check dashboard-be/routes/agent-routes.js
-node --check dashboard-fe/public/dashboard.js
-```
-
-전체 테스트:
-
-```bash
-npm test
-```
-
-Diff whitespace 확인:
-
-```bash
-git diff --check
-```
-
----
-
-## 11. 현재 테스트 범위
-
-현재 테스트에는 다음 흐름이 포함됩니다.
-
-* site_id당 running 실험 단일화 정책
-* running 실험 교체 배포 정책
-* Agent approval 기반 실험 배포
-* Redis event summary store
-* Redis session analytics service
-* Kafka primary collect handler
-* Redis unavailable 응답 처리
-* A/B config 중복 running 방어 로직
-
----
-
-## 12. Legacy 및 추후 정리 후보
-
-현재 운영 기준 read/write path는 Kafka와 Redis 중심으로 전환되었습니다.
-
-다만 다음 legacy 요소는 아직 일부 기능에서 참조될 수 있어 바로 삭제하지 않습니다.
-
-| 항목                                       | 상태 | 이유                                                           |
-| ---------------------------------------- | -- | ------------------------------------------------------------ |
-| `events.jsonl`                           | 보류 | legacy metrics/chat tools 일부와 과거 데이터 보관                      |
-| `createCompositeEventStore`              | 보류 | 기존 unit test 및 legacy store abstraction 가능성                  |
-| `analytics/pipeline.js`                  | 보류 | Redis analytics service가 label summary/input builder 일부를 재사용 |
-| Commerce demo services                   | 보류 | chat/commerce assistant와 API route에서 참조                      |
-| `scenario-data.js`, sample/eval fixtures | 보류 | 테스트 및 시나리오 생성에서 사용                                           |
-
-추후 정리 방향:
-
-```txt
-1. legacy fileEventStore 참조 제거
-2. events.jsonl 기반 chat tool 정리
-3. analytics/pipeline.js의 순수 함수와 file pipeline 분리
-4. ENABLE_KAFKA_DUAL_WRITE env 이름 정리
-5. legacy commerce/demo 기능 유지 여부 결정
-```
-
----
-
-## 13. 현재 상태 요약
-
-현재 Dashboard의 핵심 데이터 흐름은 다음과 같습니다.
-
-```txt
-SDK
-  ↓
-/collect
-  ↓
-Kafka
-  ↓
-event-consumer
-  ↓
-Redis read model
-  ↓
-Dashboard API
-  ↓
-Dashboard UI
-```
-
-즉, 현재 Dashboard는 초기 MVP의 `events.jsonl` 기반 로그 뷰어 구조에서 벗어나, Kafka와 Redis를 중심으로 한 실시간 UX 분석 대시보드 구조로 전환되었습니다.
