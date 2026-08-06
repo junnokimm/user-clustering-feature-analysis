@@ -69,17 +69,18 @@ def main() -> int:
         events = {key: events[key] for key in chosen_ids}
     manifest = split_sessions(metadata, args.split_seed)
     (output_dir / "split_manifest.json").write_text(json.dumps({"train": manifest.train_ids, "validation": manifest.validation_ids, "test": manifest.test_ids, "seed": manifest.seed, "stratification": manifest.stratification}, indent=2), encoding="utf-8")
-    matrix, columns = _features(metadata, events, sorted(metadata))
-    _write_csv(output_dir / "extracted_features.csv", [{"session_id": session_id, **dict(zip(columns, row))} for session_id, row in zip(sorted(metadata), matrix)])
+    full_feature_matrix, columns = _features(metadata, events, sorted(metadata))
+    _write_csv(output_dir / "extracted_features.csv", [{"session_id": session_id, **dict(zip(columns, row))} for session_id, row in zip(sorted(metadata), full_feature_matrix)])
     (output_dir / "experiment_config.json").write_text(json.dumps(vars(args), indent=2), encoding="utf-8")
     (output_dir / "environment.json").write_text(json.dumps({"python": sys.version, "platform": platform.platform()}, indent=2), encoding="utf-8")
     index = {session_id: position for position, session_id in enumerate(sorted(metadata))}
     results: list[dict] = []
     for feature_set in args.feature_subsets:
         selected = [columns.index(name) for name in FEATURE_SETS[feature_set]]
-        train, validation, test = (matrix[[index[item] for item in ids]][:, selected] for ids in (manifest.train_ids, manifest.validation_ids, manifest.test_ids))
-        processor = TrainOnlyPreprocessor(FEATURE_SETS[feature_set]).fit(train)
-        train, validation, test = processor.transform(train), processor.transform(validation), processor.transform(test)
+        subset_matrix = full_feature_matrix[:, selected]
+        train_matrix, validation_matrix, test_matrix = (subset_matrix[[index[item] for item in ids]] for ids in (manifest.train_ids, manifest.validation_ids, manifest.test_ids))
+        processor = TrainOnlyPreprocessor(FEATURE_SETS[feature_set]).fit(train_matrix)
+        train_matrix, validation_matrix, test_matrix = processor.transform(train_matrix), processor.transform(validation_matrix), processor.transform(test_matrix)
         for pipeline_name in args.pipelines:
             for seed in args.seeds:
                 run_dir = output_dir / "runs" / f"{feature_set}_{pipeline_name}_seed{seed}"
@@ -91,16 +92,16 @@ def main() -> int:
                     continue
                 run_dir.mkdir(parents=True, exist_ok=True)
                 try:
-                    train_labels, validation_labels, test_labels, extra = PIPELINES[pipeline_name](train, validation, test, seed)
+                    train_labels, validation_labels, test_labels, extra = PIPELINES[pipeline_name](train_matrix, validation_matrix, test_matrix, seed)
                     labels_by_session = {session_id: metadata[session_id].persona_id for session_id in manifest.test_ids}
                     prediction_by_session = {session_id: int(cluster) for session_id, cluster in zip(manifest.test_ids, test_labels)}
                     labels, aligned_clusters = align_predictions(manifest.test_ids, labels_by_session, prediction_by_session)
-                    metrics = evaluate(test, labels, aligned_clusters) | extra
+                    metrics = evaluate(test_matrix, labels, aligned_clusters) | extra
                     prediction_rows = [{"session_id": session_id, "true_label": labels_by_session[session_id], "cluster": prediction_by_session[session_id]} for session_id in sorted(manifest.test_ids)]
                     _write_csv(run_dir / "predictions.csv", prediction_rows, ("session_id", "true_label", "cluster"))
-                    personas, cluster_ids, matrix = contingency(labels, aligned_clusters)
+                    personas, cluster_ids, contingency_matrix = contingency(labels, aligned_clusters)
                     contingency_dir = output_dir / "contingency"; contingency_dir.mkdir(exist_ok=True)
-                    contingency_rows = [{"persona": persona, **{str(cluster): int(matrix[row_index, column_index]) for column_index, cluster in enumerate(cluster_ids)}} for row_index, persona in enumerate(personas)]
+                    contingency_rows = [{"persona": persona, **{str(cluster): int(contingency_matrix[row_index, column_index]) for column_index, cluster in enumerate(cluster_ids)}} for row_index, persona in enumerate(personas)]
                     _write_csv(contingency_dir / f"{feature_set}_{pipeline_name}_seed{seed}.csv", contingency_rows, ("persona", *(str(cluster) for cluster in cluster_ids)))
                     (run_dir / "cluster_mapping.json").write_text(json.dumps({str(key): value for key, value in cluster_mapping(labels, aligned_clusters).items()}, indent=2, sort_keys=True), encoding="utf-8")
                     (run_dir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")

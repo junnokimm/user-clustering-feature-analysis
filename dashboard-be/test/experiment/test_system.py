@@ -1,5 +1,9 @@
+import json
+import sys
+
 import numpy as np
 
+from experiment import cli
 from experiment.cli import _write_csv
 from experiment.evaluation import align_predictions, contingency, macro_f1_hungarian
 from experiment.feature_extractor import extract_features
@@ -65,6 +69,39 @@ def test_csv_writer_preserves_declared_schema_order(tmp_path) -> None:
         ("session_id", "true_label", "cluster"),
     )
     assert output.read_text(encoding="utf-8").splitlines()[0] == "session_id,true_label,cluster"
+
+
+def test_cli_keeps_full_feature_matrix_for_following_subsets(tmp_path, monkeypatch) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    sessions = []
+    events = []
+    for persona in ("a", "b", "c", "d", "e"):
+        for number in range(20):
+            session_id = f"{persona}-{number:02d}"
+            sessions.append({"session_id": session_id, "persona_id": persona, "ground_truth_label": persona, "difficulty": "easy"})
+            events.extend((
+                {"session_id": session_id, "ts": 1, "event_name": "page_view", "path": "/"},
+                {"session_id": session_id, "ts": 2, "event_name": "click", "path": f"/product/{number % 3}"},
+            ))
+    (data_dir / "sessions.json").write_text(json.dumps({"sessions": sessions}), encoding="utf-8")
+    (data_dir / "events.jsonl").write_text("\n".join(json.dumps(event) for event in events), encoding="utf-8")
+
+    observed_shapes = []
+
+    def run_pipeline(train, validation, test, seed):
+        observed_shapes.append((train.shape, validation.shape, test.shape, seed))
+        return np.zeros(len(train), dtype=int), np.zeros(len(validation), dtype=int), np.zeros(len(test), dtype=int), {}
+
+    for pipeline_name in ("A1", "A2", "A3"):
+        monkeypatch.setitem(cli.PIPELINES, pipeline_name, run_pipeline)
+    output_dir = tmp_path / "output"
+    monkeypatch.setattr(sys, "argv", ["experiment.cli", "--data-dir", str(data_dir), "--feature-subsets", "F11", "F13", "--pipelines", "A1", "A2", "A3", "--seeds", "7", "42", "--split-seed", "2026", "--output-dir", str(output_dir)])
+
+    assert cli.main() == 0
+    assert len(observed_shapes) == 12
+    assert {shape[:3] for shape in observed_shapes} == {((70, 14), (15, 14), (15, 14))}
+    assert all((output_dir / "runs" / f"{subset}_{pipeline}_seed{seed}" / "status.json").exists() for subset in ("F11", "F13") for pipeline in ("A1", "A2", "A3") for seed in (7, 42))
 
 
 def test_split_manifest_rejects_overlap() -> None:
